@@ -1,0 +1,39 @@
+{
+    "l1_parameter" : {
+        "min" : .00001,
+        "max" : .01,
+        "scale" : "log",
+        "type" : "float"
+    },
+    "l1_parameter_growth" : 1,
+    "grow_l1_every_n_iter" : 1000,
+    "intermediate_dimension" : {
+        "min" : 50,
+        "max" : 500,
+        "scale" : "linear",
+        "type" : "int"
+    },
+    "ntrain_iters" : {
+        "min" : 30000,
+        "max" : 100000,
+        "scale" : "linear",
+        "type" : "int",
+    },
+    "n_matrices_to_factorize_into" : {
+        "min" : 4,
+        "max" : 20,
+        "scale" : "linear",
+        "type" : "int"
+    },
+    "lr" : 3e-2,
+    "lr_decay" : .995,
+    "decay_lr_every_n_iter" : 1000,
+    "init_normal_stdev" : .01,
+    "zero_out_threshold" : {
+        "min": 1e-3,
+        "max": 1e-1,
+        "scale" : "log",
+        "type" : "float"
+    },
+    "print_every" : 100
+}
