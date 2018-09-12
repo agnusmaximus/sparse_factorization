@@ -1,9 +1,0 @@
-import sys
-
-plot_dir = sys.argv[1]
-files = glob.glob("%s/*" % plot_dir)
-data = []
-for f in files:
-    data.append(eval(f.read()))
-
-    
