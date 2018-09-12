@@ -118,6 +118,7 @@ class MnistApp(TfApp):
         scale=0.01, scope=None
       )
       regularization_penalty = tf.contrib.layers.apply_regularization(l1_regularizer, tf.trainable_variables())
+      regularization_penalty = 0
       
       with tf.name_scope('loss'):
         cross_entropy = tf.losses.sparse_softmax_cross_entropy(
@@ -184,7 +185,8 @@ class MnistApp(TfApp):
       with self.sess.graph.as_default():
         #candidates = (tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='fc1') + 
         #              tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='fc2'))        
-        candidates = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='fc2')
+        #candidates = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='fc2')
+        candidates = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='fc1')
         for i in candidates:
           if len(i.get_shape().as_list()) > 1 and "Adam" not in i.name:
             layers.append(i)

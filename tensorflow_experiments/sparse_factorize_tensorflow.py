@@ -18,56 +18,231 @@ def merge_dict(dst, src):
 def debug_generate_factorizable_matrix(dimension, product_of_n_matrices=3):
     A = None
     for i in range(product_of_n_matrices):
-        v = np.random.randn(dimension, 1) / 2
+        v = np.random.randn(dimension, 1) / 10
         v = v.dot(v.T)
         if A is None:
             A = np.eye(dimension) + v
         else:
             A = A.dot(np.eye(dimension) + v)
+    print("FROB: ", np.linalg.norm(A))
     return A
 
+def factorize(A, hyperparameters):
+    #l1_regularizer_parameter = hyperparameters["l1_regularizer_parameter"]
+    #dimension = hyperparameters["dimension"]
+    #zero_out_threshold = hyperparameters["zero_out_threshold"]
+    #lr = hyperparameters["lr"]    
+    #niters = hyperparameters["niters"]
+
+    l1_regularizer_parameter = .0001
+    zero_out_thresholds = [1e-7, 1e-7]
+    lr = 3e-3
+    niters = 10000
+    intermediate_dimension = 500
+    
+    # Factorize A in to matrices of shape shapes
+    tf.reset_default_graph()
+
+    shapes = [(A.shape[0], intermediate_dimension), (intermediate_dimension, A.shape[1])]
+    variables = []
+    for shape in shapes:
+        variables.append(tf.Variable(tf.random_normal(shape, stddev=.001 + tf.eye(*shape), dtype=tf.float32)))
+        
+    # Multiply the variables together
+    to_optimize = variables[0] + tf.eye(*tuple(variables[0].get_shape().as_list()))
+    for variable in variables[1:]:
+        to_optimize = tf.matmul(to_optimize, tf.eye(*tuple(variable.get_shape().as_list())) + variable)
+        #to_optimize = tf.matmul(to_optimize, variable)
+
+    assert(tuple(to_optimize.get_shape().as_list()) == tuple(A.shape))
+        
+    # Construct the optimization
+    target_placeholder = tf.placeholder(tf.float32, shape=A.shape)
+    loss_frobenius_error = tf.norm(target_placeholder - to_optimize)
+
+    # Add l1 loss
+    l1_parameter_placeholder = tf.placeholder(dtype=tf.float32)
+    l1_regularizer = tf.contrib.layers.l1_regularizer(
+        scale=1.0, scope=None
+    )
+    regularization_penalty = tf.contrib.layers.apply_regularization(l1_regularizer, variables)
+    loss = loss_frobenius_error + l1_parameter_placeholder * regularization_penalty
+    #loss = loss_frobenius_error
+
+    # Create opt
+    lr_placeholder = tf.placeholder(dtype=tf.float32)
+    opt = tf.train.GradientDescentOptimizer(learning_rate=lr_placeholder)
+    minimize = opt.minimize(loss)
+
+    # Zero out values below absolute threshold
+    zero_ops = []
+    with tf.control_dependencies([minimize]):
+        for matrix, thresh in zip(variables, zero_out_thresholds):
+            mask = tf.cast(tf.greater(tf.abs(matrix), thresh *
+                                      tf.ones_like(matrix, dtype=tf.float32)), tf.float32)
+            zero_ops.append(tf.assign(matrix, tf.multiply(mask, matrix)))    
+        minimize_and_zero_out = tf.group(zero_ops)    
+
+    # Do optimization
+    sess = tf.Session()
+    sess.run(tf.global_variables_initializer())
+
+    results = []
+    for i in range(niters):
+        _, loss_materialized, loss_frobenius_error_materialized = sess.run([minimize_and_zero_out, loss, loss_frobenius_error],
+                                                              feed_dict={
+                                                                  target_placeholder : A,
+                                                                  l1_parameter_placeholder : l1_regularizer_parameter,
+                                                                  lr_placeholder : lr
+                                                              })
+        
+        
+        if i % 100 == 0:
+            # Also calculate sparsity
+            variables_materialized = sess.run(variables)
+            total_number_of_nnzs = sum([np.count_nonzero(x) for x in variables_materialized])
+            nnzs = [np.count_nonzero(x) for x in variables_materialized]
+            
+            print("Loss: %g, Loss_frob_error: %g, # nnzs in factored matrices: %d, nnzs: %s" % (
+                loss_materialized, loss_frobenius_error_materialized, total_number_of_nnzs,
+                str(nnzs)))
+            results.append((total_number_of_nnzs, loss_frobenius_error_materialized))
+
+    all_results = {
+        "hyperparameters" : hyperparameters,
+        "target_matrix" : A,
+        "results" : results
+    }
+    vs = sess.run(variables)
+    print([np.count_nonzero(v) for v in vs])
+    return [(v + np.eye(*v.shape), np.count_nonzero(v)) for v in vs], all_results
+    #return [(v, np.count_nonzero(v)) for v in vs], all_results
+
+def successive_factorization(A):
+    matrices = [(A, np.count_nonzero(A))]
+    for i in range(6):
+        matrices_nnzs = [x[1] for x in matrices]
+        print("--------------------------------------")
+        print("TOTAL NNZS IN SUCCESSIVE FACTORIZATION: %d" % sum(matrices_nnzs))
+        print("NNZS IN FACTORIZATION: %s" % str(matrices_nnzs))
+        print("NNZS IN ORIGINAL MATRIX: %d" % np.count_nonzero(A))
+        print("TOTAL NNZS (including ident): %g" % (sum([np.count_nonzero(x[0]) for x in matrices])))
+
+        cur_matrix = matrices[0][0]
+        for matrix in matrices[1:]:
+            cur_matrix = cur_matrix.dot(matrix[0])
+        frob_error = np.linalg.norm(A-cur_matrix)
+        
+        print("FROBENIUS ERROR: %g" % frob_error)
+        print("NORMALIZED FROBENIUS ERROR: %g" % (frob_error / np.linalg.norm(A)))
+        print("--------------------------------------")
+        
+        matrix_to_factorize_index = np.argmax(matrices_nnzs)
+        matrix_to_factorize = matrices[matrix_to_factorize_index]
+        factorized, result_details = factorize(matrix_to_factorize[0], None)
+
+        nnzs_of_factorized = [x[1] for x in factorized]
+        print(nnzs_of_factorized, matrix_to_factorize[1])
+        if sum(nnzs_of_factorized) < matrix_to_factorize[1]:
+            matrices = matrices[:matrix_to_factorize_index] + factorized + matrices[matrix_to_factorize_index+1:]
+
+
+    matrices_nnzs = [x[1] for x in matrices]
+    print("--------------------------------------")
+    print("TOTAL NNZS IN SUCCESSIVE FACTORIZATION: %d" % sum(matrices_nnzs))
+    print("NNZS IN FACTORIZATION: %s" % str(matrices_nnzs))
+    print("NNZS IN ORIGINAL MATRIX: %d" % np.count_nonzero(A))
+    print("TOTAL NNZS (including ident): %g" % (sum([np.count_nonzero(x[0]) for x in matrices])))
+
+    cur_matrix = matrices[0][0]
+    for matrix in matrices[1:]:
+        cur_matrix = cur_matrix.dot(matrix[0])
+    frob_error = np.linalg.norm(A-cur_matrix)
+
+    print("FROBENIUS ERROR: %g" % frob_error)
+    print("NORMALIZED FROBENIUS ERROR: %g" % (frob_error / np.linalg.norm(A)))
+    print("--------------------------------------")            
+
+    product_of_matrices = matrices[0][0]
+    for matrix in matrices[1:]:
+        product_of_matrices = product_of_matrices.dot(matrix[0])
+    results = {
+        "factorized_matrices" : [x[0] for x in matrices],
+        "product_of_matrices" : product_of_matrices,
+        "frobenius_error" : frob_error,
+        "original_nnz_elements" : np.count_nonzero(A),
+        "target_matrix" : A,
+        "n_nnz_elements" : sum([np.count_nonzero(x[0]) for x in matrices]),
+        "hyperparameter_setting" : None,
+    }
+    return results
+            
+
 def sparse_factorize(target_matrix, **hyperparameters):
+    return successive_factorization(target_matrix)
+
     hyperparameter_defaults = {
-        "l1_parameter" : 0.002, # Tune
+        "l1_parameter" : 0.05, # Tune
         "l1_parameter_growth" : 1,
         "grow_l1_every_n_iter" : 1000,
-        "intermediate_dimension" : 100, # Tune
-        "ntrain_iters" : 10000,
-        "n_matrices_to_factorize_into" : 16, # Tune 
-        "lr" : 3e-2,
+        "intermediate_dimension" : 2000, # Tune
+        "ntrain_iters" : 2000,
+        "n_matrices_to_factorize_into" : 20, # Tune 
+        "lr" : 1e-2,
         "lr_decay" : .995,
         "decay_lr_every_n_iter" : 1000,
         "init_normal_stdev" : .01,
-        "zero_out_threshold" : 1e-2, # Tune
+        "zero_out_threshold" : 8e-3, # Tune,
+        "dense_factorize" : False,
         "print_every" : 100
     }
 
     hyperparameters = merge_dict(hyperparameters,
                                  hyperparameter_defaults)
 
-    #hyperparameters["intermediate_dimension"] = 100
-
     print("sparse_factorize: Using hyperparameters")
     print(hyperparameters)
 
-    # Construct graph
     M,K = target_matrix.shape
     Z = hyperparameters["intermediate_dimension"]
 
-    # Construct variables to optimize
-    to_optimize = [
-        tf.Variable(tf.random_normal((M, Z), stddev=hyperparameters["init_normal_stdev"]) + tf.eye(M, Z), dtype=tf.float32)
-    ] + [
-        tf.Variable(tf.random_normal((Z, Z), stddev=hyperparameters["init_normal_stdev"]) +
-                    tf.eye(Z), dtype=tf.float32) for i in range(hyperparameters["n_matrices_to_factorize_into"]-2)
-    ] + [
-        tf.Variable(tf.random_normal((Z, K), stddev=hyperparameters["init_normal_stdev"]) + tf.eye(Z, K), dtype=tf.float32)
-    ]
+    if hyperparameters["dense_factorize"]:
 
-    # Create matmul chain
-    cur_matrix = to_optimize[0]
-    for matrix in to_optimize[1:]:
-        cur_matrix = tf.matmul(cur_matrix, matrix)
+        n_mats = hyperparameters["n_matrices_to_factorize_into"]
+        first_shape, last_shape = (M,Z*(n_mats-2+1)), (Z, K)
+        intermediate_shapes = []
+        for i in range(n_mats-2):
+            intermediate_shapes.insert(0, (Z, (i+1)*Z))
+            
+        to_optimize = [tf.Variable(tf.random_normal(shp, stddev=hyperparameters["init_normal_stdev"]) + tf.eye(*shp), dtype=tf.float32) for shp in [first_shape] + intermediate_shapes + [last_shape]]
+
+        cur_matrix = to_optimize[0]
+        for ind, matrix in enumerate(to_optimize[1:]):
+            cur_matrix_shape = cur_matrix.get_shape().as_list()
+            matrix_shape = matrix.get_shape().as_list()
+            print(cur_matrix_shape[1], matrix_shape[0], matrix_shape[1], Z)
+            print(ind, len(to_optimize))
+            if ind != len(to_optimize[1:])-1:
+                stacked = tf.concat([tf.eye(matrix_shape[1]), matrix], axis=0)
+            else:
+                stacked = matrix
+            #cur_matrix = tf.matmul(cur_matrix, tf.eye(*tuple(stacked.get_shape().as_list()) + stacked))
+            cur_matrix = tf.matmul(cur_matrix, stacked)
+    else:
+        # Construct graph
+        # Construct variables to optimize
+        to_optimize = [
+            tf.Variable(tf.random_normal((M, Z), stddev=hyperparameters["init_normal_stdev"]) + tf.eye(M, Z), dtype=tf.float32)
+        ] + [
+            tf.Variable(tf.random_normal((Z, Z), stddev=hyperparameters["init_normal_stdev"]) +
+                        tf.eye(Z), dtype=tf.float32) for i in range(hyperparameters["n_matrices_to_factorize_into"]-2)
+        ] + [
+            tf.Variable(tf.random_normal((Z, K), stddev=hyperparameters["init_normal_stdev"]) + tf.eye(Z, K), dtype=tf.float32)
+        ]
+
+        cur_matrix = to_optimize[0]
+        for matrix in to_optimize[1:]:
+            cur_matrix = tf.matmul(cur_matrix, matrix)
 
     # Matrix placeholders
     target_placeholder = tf.placeholder(tf.float32, shape=target_matrix.shape)
@@ -157,6 +332,7 @@ def sparse_factorize(target_matrix, **hyperparameters):
     # Compute frobenius error
     product_of_matrices = sess.run(cur_matrix)
     frobenius_error = np.linalg.norm(product_of_matrices - target_matrix)
+    target_matrix_error = np.linalg.norm(target_matrix)
 
     # Materialize actual matrices
     materialized_factorizations = []
@@ -181,6 +357,7 @@ def sparse_factorize(target_matrix, **hyperparameters):
     print("original matrix nnz elements: %d" % original_nnz_elements)
     print("nnz elements: %d" % n_nnz_elements)
     print("frobenius error: %g" % frobenius_error)
+    print("target matrix norm: %g" % target_matrix_error)
     print("nnzs of factorized matrices: %s" % str([np.count_nonzero(x) for x in materialized_factorizations]))
     return results
 
