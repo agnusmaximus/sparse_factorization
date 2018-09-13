@@ -194,7 +194,8 @@ class SparseFactorizationWithL1AndPruningTF(SparseFactorizationBase):
         calculated_frobenius_error = np.linalg.norm(product_of_factors - A)
 
         # Some sanity checks
-        assert(np.linalg.norm(product_of_factors_materialized - product_of_factors) < 1e-6)
+        #print(np.linalg.norm(product_of_factors_materialized - product_of_factors))
+        #assert(np.linalg.norm(product_of_factors_materialized - product_of_factors) < 1e-6)
                 
         result_data = {
             "log_result_data" : log_result_data,
@@ -315,3 +316,51 @@ class SparseFactorizationWithL1AndPruningPytorch(SparseFactorizationWithL1AndPru
 
         return  variables_materialized, result_data
         
+class Successive2Factorization(SparseFactorizationBase):
+
+    def __init__(self, hyperparameters, factorization_method, factorization_method_hyperparameters):
+        """
+        hyperparameters - hyperparameters for successive2factorization
+        factorization_method - class of type SparseFactorizationBase to sparse factor matrix
+        factorization_method_hyperparameters - hyperparameters for factorization_method
+        """
+        super().__init__(hyperparameters)
+        self.factorization_method = factorization_method
+        self.factorization_method_hyperparameters = factorization_method_hyperparameters
+
+    def get_hyperparameter_defaults(self):
+        return {
+            "n_factorization_rounds" : 4
+        }
+
+    def factorize(self, A):
+        num_rounds = self.get_hyperparameter_defaults()["n_factorization_rounds"]
+        matrices = [A]
+        result_details = []
+        for i in range(num_rounds):
+
+            # Create factorizer
+            factorizer = self.factorization_method(self.factorization_method_hyperparameters)
+
+            # Get densest matrix
+            nonzeros = [np.count_nonzero(x) for x in matrices]
+            densest_matrix_index = np.argmax(nonzeros)
+            densest_matrix = matrices[densest_matrix_index]
+            densest_nnzs = nonzeros[densest_matrix_index]
+
+            factorized, _ = factorizer.factorize(densest_matrix)
+            factorized_nnzs = [np.count_nonzero(x-np.eye(*x.shape)) for x in factorized]
+            factorized_nnzs_sum = sum(factorized_nnzs)
+
+            if factorized_nnzs_sum <= densest_nnzs:
+                matrices = matrices[:densest_matrix_index] + factorized + matrices[densest_matrix_index+1:]
+                
+                print("Successive2Factorization - Factorized matrix from %d => [%d,%d]" %
+                      (densest_nnzs, factorized_nnzs[0], factorized_nnzs[1]))
+                
+                matrices_nnzs = [np.count_nonzero(x) for x in matrices]
+                print("Successive2Factorization - Matrix nnzs: %s" % str(matrices_nnzs))
+                result_details.append({
+                    "matrices_nnzs" : matrices_nnzs
+                })
+        return matrices, result_details
