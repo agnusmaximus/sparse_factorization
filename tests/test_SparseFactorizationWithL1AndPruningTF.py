@@ -49,7 +49,7 @@ class SparseFactorizationWithL1AndPruningTFTest(unittest.TestCase):
 
             errors.append(result_details["calculated_frobenius_error"])
 
-        assert(abs(errors[0]-errors[1]) < 1e-6)
+        assert(abs(errors[0]-errors[1]) < 1e-6)        
 
 if __name__ == "__main__":
     print("Running test_SparseFactorizationWithL1AndPruningTF.py")

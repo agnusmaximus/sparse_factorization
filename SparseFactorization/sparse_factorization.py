@@ -208,3 +208,110 @@ class SparseFactorizationWithL1AndPruningTF(SparseFactorizationBase):
         sess.close()
         
         return  variables_materialized, result_data
+
+class SparseFactorizationWithL1AndPruningPytorch(SparseFactorizationWithL1AndPruningTF):
+
+    def factorize(self, A):
+
+        # Seed
+        seed = self.get_hyperparameters()["seed"]
+        torch.cuda.manual_seed_all(seed)
+        torch.manual_seed(seed)
+
+        # Use cuda device if possible
+        device = torch.device('cuda')
+
+        # Create shapes
+        first_shape, last_shape = (
+            (A.shape[0], self.get_hyperparameters()["intermediate_dimension"]),
+            (self.get_hyperparameters()["intermediate_dimension"], A.shape[1])
+        )
+        
+        intermediate_shapes = [(self.get_hyperparameters()["intermediate_dimension"],
+                                self.get_hyperparameters()["intermediate_dimension"]) for i in
+                               range(self.get_hyperparameters()["number_of_factors"]-2)]
+        all_shapes = [first_shape] + intermediate_shapes + [last_shape]
+
+        # Create variables
+        variables = []
+        for shape in all_shapes:
+            stdev = self.get_hyperparameters()["initialization_stdev"]
+            weights = np.random.normal(0, scale=stdev, size=shape)
+            variables.append(torch.tensor(weights, device=device, requires_grad=True))
+        
+        # Extract params
+        training_iters = self.get_hyperparameters()["training_iters"]
+        log_every = self.get_hyperparameters()["log_every"]
+        lr = self.get_hyperparameters()["learning_rate"]
+        l1 = self.get_hyperparameters()["l1_parameter"]
+        log_result_data = []
+
+        # optimizer
+        optimizer = torch.optim.SGD(variables, lr=lr)
+        for i in range(training_iters):
+
+            # Create prediction
+            prediction = variables[0] + torch.eye(*tuple(variables[0].size()), device=device, dtype=torch.double)
+            for variable in variables[1:]:
+                prediction = prediction.mm(variable + torch.eye(*tuple(variable.size()), device=device, dtype=torch.double))
+
+            # Add l1 regularization
+            l1_reg = None
+            for variable in variables:
+                if l1_reg is None:
+                    l1_reg = variable.norm(1)
+                else:
+                    l1_reg = l1_reg + variable.norm(1)
+
+            # Create the loss
+            loss = (prediction - torch.tensor(A, device=device)).norm(2) + l1_reg * l1
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # Prune weights
+            for variable in variables:
+                threshold = self.get_hyperparameters()["pruning_threshold"]
+                variable.data[np.abs(variable.data) < threshold] = 0                
+                            
+            if i % log_every == 0 or i == training_iters-1:
+                loss_materialized = loss.item()
+                frob_error_materialized = np.linalg.norm(prediction.cpu().data.numpy() - A)
+                variables_materialized = [x.cpu().data.numpy() for x in variables]
+                nonzeros = [np.count_nonzero(x) for x in variables_materialized]
+                sum_nonzeros = sum(nonzeros)
+
+                log_result_data.append({
+                    "frobenius_error" : frob_error_materialized,
+                    "loss" : loss_materialized,
+                    "variables_nonzero_count" : nonzeros,
+                    "sum_nonzeros" : sum_nonzeros
+                })
+
+                print("SparseFactorizationWithL1AndPruningPytorch: Frob error: %g, Loss: %g, Variables NNzs: %s, Sum NNzs: %g" % (
+                    frob_error_materialized,
+                    loss_materialized,
+                    str(nonzeros),
+                    sum_nonzeros
+                ))                
+                
+        variables_materialized = [x.cpu().data.numpy() for x in variables]
+        variables_materialized = [x + np.eye(*x.shape) for x in variables_materialized]
+
+        final_sum_nonzeros = sum([np.count_nonzero(x) for x in variables_materialized])        
+        product_of_factors = variables_materialized[0] 
+        for variable_materialized in variables_materialized[1:]:
+            product_of_factors = product_of_factors.dot(variable_materialized)
+        calculated_frobenius_error = np.linalg.norm(product_of_factors - A)
+
+        result_data = {
+            "log_result_data" : log_result_data,
+            "final_sum_nonzeros" : final_sum_nonzeros,            
+            "product_of_factors" : product_of_factors,
+            "result_factors" : variables_materialized,
+            "calculated_frobenius_error" : calculated_frobenius_error,
+            "A" : A
+        }
+
+        return  variables_materialized, result_data
+        
