@@ -1,4 +1,210 @@
 import sys
 import torch
+import tensorflow as tf
+import numpy as np
+from SparseFactorization.utils import utils
 
+class SparseFactorizationBase(object):
+    """
+    Base class for sparse factorization.
+    """
+    def __init__(self, hyperparameters={}):
 
+        # Merge hyperparameters.
+        self.hyperparameters = utils.merge_dict(self.get_hyperparameter_defaults(),
+                                                hyperparameters)
+        
+        # Check hyperparameters are valid
+        self.validate_hyperparameters()
+
+    def validate_hyperparameters(self):
+        
+        # Make sure there are no extra keys that are not in the default dict.
+        keys_set_difference = set(self.hyperparameters.keys()) - set(self.get_hyperparameter_defaults().keys())
+        if len(keys_set_difference) != 0:
+            raise Exception("Unknown keys to class %s: %s" % (self.__class__.__name__, set(keys_set_difference)))        
+
+    def factorize(self, A):
+        """
+        Factorize A into sparse matrices according to hyperparameters.
+        Returns 2 things:
+        1) Factorized matrices (in which prod(fact_matrices) ~ A)
+        2) Result details (for logging, plotting, etc)
+        """
+        raise NotImplementedError()
+
+    def get_hyperparameter_defaults(self):
+        """
+        Returns hyperparameter defaults of sparse factorization.
+        """
+        return {}
+
+    @staticmethod
+    def get_hyperparameter_space():
+        raise NotImplementedError()
+
+    def get_hyperparameters(self):
+        """
+        Returns hyperparameters of the sparse factorization instance.
+        """
+        return self.hyperparameters
+
+class SparseFactorizationWithL1AndPruningTF(SparseFactorizationBase):
+
+    def __init__(self, hyperparameters={}):
+        super().__init__(hyperparameters)
+        
+    def get_hyperparameter_defaults(self):
+        return {
+            # The following implies factored into:
+            # A = A_1 A_2. If A is MxN, then
+            # A_1 is MxIntermediateDimenion,
+            # A_2 is IntermediateDimensionxN
+            "intermediate_dimension" : 100,
+            "number_of_factors" : 2,
+
+            # Optimization parameters
+            "learning_rate" : 1e-3,
+            "l1_parameter" : 1e-2,
+            "pruning_threshold" : 1e-3, # Parameters with abs value smaller than this are zeroed
+            "training_iters" : 10000,
+
+            # Initialization parameters
+            "initialization_stdev" : .01,
+
+            # Config parameters
+            "log_every" : 100,
+            "seed" : 0
+        }
+
+    def validate_hyperparameters(self):
+        super().validate_hyperparameters()
+
+        if self.get_hyperparameters()["number_of_factors"] < 2:
+            raise Exception("Number of factors needs to be >= 2, got: %d" % self.get_hyperparameters()["number_of_factors"])
+ 
+    def factorize(self, A):
+
+        tf.reset_default_graph()
+        utils.set_all_seeds(self.get_hyperparameters()["seed"])
+        
+        # Manage shapes
+        first_shape, last_shape = (
+            (A.shape[0], self.get_hyperparameters()["intermediate_dimension"]),
+            (self.get_hyperparameters()["intermediate_dimension"], A.shape[1])
+        )
+
+        intermediate_shapes = [(self.get_hyperparameters()["intermediate_dimension"],
+                               self.get_hyperparameters()["intermediate_dimension"]) for i in
+                              range(self.get_hyperparameters()["number_of_factors"]-2)]
+        all_shapes = [first_shape] + intermediate_shapes + [last_shape]
+
+        # Create tensorflow variables
+        variables = []
+        for shape in all_shapes:
+            stdev = self.get_hyperparameters()["initialization_stdev"]
+            variables.append(tf.Variable(tf.random_normal(shape,
+                                                          stddev=stdev) +
+                                         tf.eye(*shape), dtype=tf.float32))
+
+        # Create optimization procedure
+        product_of_factors = variables[0] + tf.eye(*tuple(variables[0].get_shape().as_list()))
+        for variable in variables[1:]:
+            product_of_factors = tf.matmul(product_of_factors,
+                                           variable + tf.eye(*tuple(variable.get_shape().as_list())))
+
+        A_placeholder = tf.placeholder(dtype=tf.float32, shape=A.shape)
+        frobenius_error = tf.norm(A_placeholder - product_of_factors)
+
+        # Add l1 loss
+        l1_placeholder = tf.placeholder(dtype=tf.float32)
+        l1_regularizer = tf.contrib.layers.l1_regularizer(
+            scale=1.0, scope=None
+        )
+        regularization_penalty = tf.contrib.layers.apply_regularization(l1_regularizer, variables)
+        loss = frobenius_error + l1_placeholder * regularization_penalty
+
+        # Create optimization
+        lr_placeholder = tf.placeholder(dtype=tf.float32)
+        opt = tf.train.GradientDescentOptimizer(learning_rate=lr_placeholder)
+        minimize = opt.minimize(loss)
+
+        # Create pruning update
+        prune_ops = []
+        for variable in variables:
+            pruning_threshold = self.get_hyperparameters()["pruning_threshold"]
+            mask = tf.cast(tf.greater(tf.abs(variable),
+                                      tf.ones_like(variable, dtype=tf.float32) * pruning_threshold), dtype=tf.float32)
+            prune_ops.append(tf.assign(variable, tf.multiply(mask, variable)))
+        prune_op = tf.group(prune_ops)
+        
+        # Create tf session
+        sess = tf.Session()
+        sess.run(tf.global_variables_initializer())
+
+        training_iters = self.get_hyperparameters()["training_iters"]
+        log_every = self.get_hyperparameters()["log_every"]
+        lr = self.get_hyperparameters()["learning_rate"]
+        l1 = self.get_hyperparameters()["l1_parameter"]
+        log_result_data = []
+        for i in range(training_iters):
+
+            # Minimize
+            _ = sess.run([minimize], feed_dict={
+                A_placeholder : A,
+                lr_placeholder : lr,
+                l1_placeholder : l1
+            })
+
+            # Prune
+            _ = sess.run([prune_op])
+            
+            if i % log_every == 0 or i == training_iters-1:
+                frob_error_materialized, loss_materialized = sess.run([frobenius_error, loss], feed_dict={
+                    A_placeholder : A,
+                    lr_placeholder : lr,
+                    l1_placeholder : l1
+                })
+                variables_materialized = sess.run(variables)
+                nonzeros = [np.count_nonzero(x) for x in variables_materialized]
+                sum_nonzeros = sum(nonzeros)
+
+                log_result_data.append({
+                    "frobenius_error" : frob_error_materialized,
+                    "loss" : loss_materialized,
+                    "variables_nonzero_count" : nonzeros,
+                    "sum_nonzeros" : sum_nonzeros
+                })
+
+                print("SparseFactorizationWithL1AndPruningTF: Frob error: %g, Loss: %g, Variables NNzs: %s, Sum NNzs: %g" % (
+                    frob_error_materialized,
+                    loss_materialized,
+                    str(nonzeros),
+                    sum_nonzeros
+                ))
+
+        # Extract final logged data
+        variables_materialized = [x + np.eye(*x.shape) for x in sess.run(variables)]
+        product_of_factors_materialized = sess.run(product_of_factors)        
+        
+        final_sum_nonzeros = sum([np.count_nonzero(x) for x in variables_materialized])        
+        product_of_factors = variables_materialized[0] 
+        for variable_materialized in variables_materialized[1:]:
+            product_of_factors = product_of_factors.dot(variable_materialized)
+        calculated_frobenius_error = np.linalg.norm(product_of_factors - A)
+
+        # Some sanity checks
+        assert(np.linalg.norm(product_of_factors_materialized - product_of_factors) < 1e-6)
+                
+        result_data = {
+            "log_result_data" : log_result_data,
+            "final_sum_nonzeros" : final_sum_nonzeros,            
+            "product_of_factors" : product_of_factors,
+            "result_factors" : variables_materialized,
+            "calculated_frobenius_error" : calculated_frobenius_error,
+            "A" : A
+        }
+
+        sess.close()
+        
+        return  variables_materialized, result_data
