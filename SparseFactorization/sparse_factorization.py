@@ -68,9 +68,11 @@ class SparseFactorizationWithL1AndPruningTF(SparseFactorizationBase):
             "l1_parameter" : 1e-2,
             "pruning_threshold" : 1e-3, # Parameters with abs value smaller than this are zeroed
             "training_iters" : 10000,
+            "l1_parameter_decay" : 1,
 
             # Initialization parameters
             "initialization_stdev" : .01,
+            "matrix_initializations" : {},
 
             # Config parameters
             "log_every" : 100,
@@ -106,15 +108,22 @@ class SparseFactorizationWithL1AndPruningTF(SparseFactorizationBase):
             variables.append(tf.Variable(tf.random_normal(shape,
                                                           stddev=stdev) +
                                          tf.eye(*shape), dtype=tf.float32))
-
+            #variables.append(tf.Variable(tf.random_normal(shape,
+            #                                              stddev=stdev)))
+                             
         # Create optimization procedure
-        product_of_factors = variables[0] + tf.eye(*tuple(variables[0].get_shape().as_list()))
+        #product_of_factors = variables[0] + tf.eye(*tuple(variables[0].get_shape().as_list()))
+        product_of_factors = variables[0]
         for variable in variables[1:]:
+            #product_of_factors = tf.matmul(product_of_factors,
+            #                               variable + tf.eye(*tuple(variable.get_shape().as_list())))
             product_of_factors = tf.matmul(product_of_factors,
-                                           variable + tf.eye(*tuple(variable.get_shape().as_list())))
+                                           variable)
 
         A_placeholder = tf.placeholder(dtype=tf.float32, shape=A.shape)
-        frobenius_error = tf.norm(A_placeholder - product_of_factors)
+        #frobenius_error = tf.norm(A_placeholder - product_of_factors)
+        #frobenius_error = tf.norm(A_placeholder - product_of_factors, 2)
+        frobenius_error = tf.nn.l2_loss(A_placeholder - product_of_factors)
 
         # Add l1 loss
         l1_placeholder = tf.placeholder(dtype=tf.float32)
@@ -142,6 +151,13 @@ class SparseFactorizationWithL1AndPruningTF(SparseFactorizationBase):
         sess = tf.Session()
         sess.run(tf.global_variables_initializer())
 
+        # initialize variables
+        matrix_initializations = self.get_hyperparameters()["matrix_initializations"]
+        for index, variable in enumerate(variables):
+            if index in matrix_initializations:
+                print("Initializing: %d" % index)
+                sess.run(tf.assign(variable, matrix_initializations[index]))
+
         training_iters = self.get_hyperparameters()["training_iters"]
         log_every = self.get_hyperparameters()["log_every"]
         lr = self.get_hyperparameters()["learning_rate"]
@@ -160,6 +176,7 @@ class SparseFactorizationWithL1AndPruningTF(SparseFactorizationBase):
             _ = sess.run([prune_op])
             
             if i % log_every == 0 or i == training_iters-1:
+                l1 *= self.get_hyperparameters()["l1_parameter_decay"]
                 frob_error_materialized, loss_materialized = sess.run([frobenius_error, loss], feed_dict={
                     A_placeholder : A,
                     lr_placeholder : lr,
