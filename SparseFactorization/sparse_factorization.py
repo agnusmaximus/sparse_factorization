@@ -3,6 +3,7 @@ import torch
 import tensorflow as tf
 import numpy as np
 from SparseFactorization.utils import utils
+from SparseFactorization.utils import complex_utils
 
 class SparseFactorizationBase(object):
     """
@@ -381,3 +382,173 @@ class Successive2Factorization(SparseFactorizationBase):
                     "matrices_nnzs" : matrices_nnzs
                 })
         return matrices, result_details
+
+class SparseFactorizationWithEnforcedStructurePytorch(SparseFactorizationBase):
+
+    def __init__(self, hyperparameters={}):
+        super().__init__(hyperparameters)
+
+    def get_hyperparameter_defaults(self):
+        return {
+
+            # Optimization parameters
+            "learning_rate" : 1e-3,
+            "l1_parameter" : 1e-2,
+            "pruning_threshold" : 1e-3, # Parameters with abs value smaller than this are zeroed
+            "training_iters" : 10000,
+            "l1_parameter_decay" : 1,
+
+            # Structure parameters
+            # ------------------------------------------------------------
+            # What to initialize each matrix to. This also determines number of factors in the
+            # optimization.
+            # E.g:
+            # matrix_initializations = {
+            #    0 : np.array([1,1],[1,1])
+            #    1 : np.array([1,1],[1,1])
+            # }
+            # Would make the optimizer do a 2-factorization with the initial matrices specified.
+            "matrix_initializations" : {},
+            
+            # Force every element in the corresponding optimized matrix to 0 if the element
+            # of the matrix in the mapping in the same position is also 0.
+            # E.g:
+            # sparsity_enforcements = {
+            #     0 : np.array([0,0,1,1],[1,1,0,0])
+            # }
+            # would make sure that the optimized matrix 0 would have 0s in the top left and bottom right.
+            "sparsity_constraints" : {},
+
+            # Like sparsity enforcements, but actually overrides the value of the optimized matrix
+            # to have exactly the same values as the referenced matrix.
+            # E.g:
+            # value_enforcements = {
+            #    0 : np.array([1,2,3,4], [5,6,7,8])
+            # }
+            # would make sure that the optimized matrix 0 would be overridden to [1,2,3,4][5,6,7,8] after each iteration
+            "value_constraints" : {},
+
+            # Complex?
+            "is_complex" : True,
+
+            # Config parameters
+            "log_every" : 100,
+            "seed" : 0
+        }
+        
+
+    def factorize(self, A):
+
+        # Seed
+        seed = self.get_hyperparameters()["seed"]
+        torch.cuda.manual_seed_all(seed)
+        torch.manual_seed(seed)
+
+        # Use cuda device if possible
+        device = torch.device('cuda')
+
+        # Create variables
+        nvars = len(self.get_hyperparameters()["matrix_initializations"])
+        variables = [None for i in range(nvars)]
+        for index, matrix in self.get_hyperparameters()["matrix_initializations"].items():
+            variables[index] = torch.tensor(matrix, device=device, requires_grad=True)
+        
+        # Extract params
+        training_iters = self.get_hyperparameters()["training_iters"]
+        log_every = self.get_hyperparameters()["log_every"]
+        lr = self.get_hyperparameters()["learning_rate"]
+        l1 = self.get_hyperparameters()["l1_parameter"]
+        log_result_data = []
+        is_complex = self.get_hyperparameters()["is_complex"]
+
+        # optimizer
+        optimizer = torch.optim.SGD(variables, lr=lr)
+        for i in range(training_iters):
+
+            # Create prediction (probably can refactor this code a bit)
+            if not is_complex:                
+
+                # The following is a formulation with the + I
+                # prediction = variables[0] + torch.eye(*tuple(variables[0].size()), device=device, dtype=torch.double)
+                # for variable in variables[1:]:
+                #     prediction = prediction.mm(variable + torch.eye(*tuple(variable.size()), device=device, dtype=torch.double))
+
+                prediction = variables[0]
+                for variable in variables[1:]:
+                    prediction = prediction.mm(variable, device=device, dtype=torch.double)
+                
+            else:
+
+                # Complex multiplication
+                prediction = variables[0]
+                for variable in variables[1:]:
+                    prediction = complex_utils.complex_mm(prediction, variable)
+
+            # Add l1 regularization
+            l1_reg = None
+            for variable in variables:
+                if l1_reg is None:
+                    l1_reg = variable.norm(1)
+                else:
+                    l1_reg = l1_reg + variable.norm(1)
+
+            # Create the loss
+            loss = (prediction - torch.tensor(A, device=device)).norm(2) + l1_reg * l1
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # Prune weights
+            for variable in variables:
+                threshold = self.get_hyperparameters()["pruning_threshold"]
+                variable.data[np.abs(variable.data) < threshold] = 0
+
+            # Enforce sparsity constraints
+            for index, sparsity_constraint in self.get_hyperparameters()["sparsity_constraints"].items():
+                #variables[index] *= torch.tensor(sparsity_constraint)
+                variables[index].data *= torch.tensor(sparsity_constraint, device=device, dtype=torch.double)
+                #print("YOOOO", variables[index].data.cpu().numpy())
+
+            # Enforce value constraints
+            for index, value_constraint in self.get_hyperparameters()["value_constraints"].items():
+                variables[index].data = torch.tensor(value_constraint, device=device, dtype=torch.double)
+                            
+            if i % log_every == 0 or i == training_iters-1:
+                loss_materialized = loss.item()
+                frob_error_materialized = np.linalg.norm(prediction.cpu().data.numpy() - A)
+                variables_materialized = [x.cpu().data.numpy() for x in variables]
+                nonzeros = [np.count_nonzero(x) for x in variables_materialized]
+                sum_nonzeros = sum(nonzeros)
+
+                log_result_data.append({
+                    "frobenius_error" : frob_error_materialized,
+                    "loss" : loss_materialized,
+                    "variables_nonzero_count" : nonzeros,
+                    "sum_nonzeros" : sum_nonzeros
+                })
+
+                print("SparseFactorizationWithL1AndPruningPytorch: Frob error: %g, Loss: %g, Variables NNzs: %s, Sum NNzs: %g" % (
+                    frob_error_materialized,
+                    loss_materialized,
+                    str(nonzeros),
+                    sum_nonzeros
+                ))                
+                
+        variables_materialized = [x.cpu().data.numpy() for x in variables]
+        #variables_materialized = [x + np.eye(*x.shape) for x in variables_materialized]
+
+        final_sum_nonzeros = sum([np.count_nonzero(x) for x in variables_materialized])
+
+        product_of_factors = prediction.cpu().data.numpy()
+        calculated_frobenius_error = np.linalg.norm(product_of_factors - A)
+
+        result_data = {
+            "log_result_data" : log_result_data,
+            "final_sum_nonzeros" : final_sum_nonzeros,            
+            "product_of_factors" : product_of_factors,
+            "result_factors" : variables_materialized,
+            "calculated_frobenius_error" : calculated_frobenius_error,
+            "A" : A
+        }
+
+        return  variables_materialized, result_data
