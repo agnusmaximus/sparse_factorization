@@ -477,12 +477,14 @@ class SparseFactorizationWithEnforcedStructurePytorch(SparseFactorizationBase):
                 for variable in variables[1:]:
                     prediction = prediction.mm(variable, device=device, dtype=torch.double)
                 
-            else:
+            else:                
 
                 # Complex multiplication
                 prediction = variables[0]
                 for variable in variables[1:]:
-                    prediction = complex_utils.complex_mm(prediction, variable)
+                    stacked_eye = np.stack([np.eye(variable.shape[0]), np.eye(variable.shape[0])], axis=2)
+                    prediction = complex_utils.complex_mm(prediction, variable + torch.tensor(stacked_eye, device=device, requires_grad=True))
+                    #prediction = complex_utils.complex_mm(prediction, variable)
 
             # Add l1 regularization
             l1_reg = None
