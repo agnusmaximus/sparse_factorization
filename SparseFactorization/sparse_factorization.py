@@ -462,7 +462,8 @@ class SparseFactorizationWithEnforcedStructurePytorch(SparseFactorizationBase):
         is_complex = self.get_hyperparameters()["is_complex"]
 
         # optimizer
-        optimizer = torch.optim.SGD(variables, lr=lr)
+        #optimizer = torch.optim.SGD(variables, lr=lr)
+        optimizer = torch.optim.Adam(variables)
         for i in range(training_iters):
 
             # Create prediction (probably can refactor this code a bit)
